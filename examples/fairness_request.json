@@ -1,0 +1,6 @@
+{
+  "_comment": "强公平复核请求模板：request_id 为调用方幂等标识；source_check_id 填第 1 步 /checks 返回的编号（先用实际编号替换占位符）；fairness_obligations 列 1..4 条来源规程中已存在的切换 id。本例声明强公平义务：req 无限出现则 t_permit 必须无限被采取，原 t_late 饥饿环被公平消除。",
+  "request_id": "fairness-demo-0001",
+  "source_check_id": "CHK-000001",
+  "fairness_obligations": ["t_permit"]
+}

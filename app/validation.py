@@ -8,6 +8,8 @@ from .ltl_parser import FormulaSyntaxError, parse_formula
 
 MIN_LOCATIONS = 2
 MAX_LOCATIONS = 24
+MIN_OBLIGATIONS = 1
+MAX_OBLIGATIONS = 4
 
 # 这些大写前缀与一元/二元算子词法冲突，不能作为命题名
 _RESERVED_INITIALS = set("FGXU")
@@ -36,6 +38,19 @@ def _valid_name(value: Any) -> bool:
 
 def validate_request(payload: Any) -> Dict[str, Any]:
     """校验并归一化请求体，返回内部结构；失败抛 :class:`ValidationError`。"""
+    spec, _ = _validate_spec(payload)
+    return spec
+
+
+def validate_request_frozen(
+    payload: Any,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """同 :func:`validate_request`，额外返回可持久化的冻结快照。"""
+    return _validate_spec(payload)
+
+
+def _validate_spec(payload: Any) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """校验规程/初态/命题/公式；同时返回归一化的原始字段（供冻结）。"""
     errors: List[str] = []
 
     if not isinstance(payload, dict):
@@ -177,7 +192,6 @@ def validate_request(payload: Any) -> Dict[str, Any]:
     except FormulaSyntaxError as exc:
         raise ValidationError([str(exc)]) from exc
 
-    # --- 死端检查（每个位置至少一条外出切换）---------------------------
     outgoing: Dict[str, List[Dict[str, str]]] = {loc: [] for loc in locations}
     for sw in switches:
         outgoing[sw["source"]].append(sw)
@@ -187,7 +201,7 @@ def validate_request(payload: Any) -> Dict[str, Any]:
             [f"位置 '{loc}' 没有外出切换（死端，禁止）" for loc in dead]
         )
 
-    return {
+    spec = {
         "locations": locations,
         "initial": initial,
         "switches": switches,
@@ -196,3 +210,119 @@ def validate_request(payload: Any) -> Dict[str, Any]:
         "formula_ast": formula_ast,
         "outgoing": outgoing,
     }
+    # 冻结快照：只含可重放的归一化字段；公式取 AST 规范形，
+    # 与空白/括号风格无关
+    frozen = {
+        "locations": list(locations),
+        "initial": initial,
+        "switches": [dict(sw) for sw in switches],
+        "propositions": {loc: sorted(plist)
+                         for loc, plist in propositions.items()},
+        "formula": formula_ast.to_str(),
+    }
+    return spec, frozen
+
+# ------------------------------------------------------- 强公平复核请求
+
+_SOURCE_ID_PREFIX = "CHK-"
+
+
+def _valid_request_id(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and 1 <= len(value) <= 128
+        and all(ch.isalnum() or ch in "_-" for ch in value)
+    )
+
+
+def validate_fairness_payload(payload: Any) -> Dict[str, Any]:
+    """只校验强公平请求自身字段（不访问审计存储）。
+
+    来源编号的**存在性**与切换是否属于来源规程，由服务层结合冻结的来源
+    记录调用 :func:`validate_obligations_against_source` 完成——任何一项
+    不通过都定位拒绝且不生成强公平审计编号。
+    """
+    errors: List[str] = []
+    if not isinstance(payload, dict):
+        raise ValidationError(["请求体必须是 JSON 对象"])
+
+    request_id = payload.get("request_id")
+    if not isinstance(request_id, str) or not request_id.strip():
+        errors.append("request_id 必须是非空字符串（幂等请求标识）")
+    elif not _valid_request_id(request_id):
+        errors.append(
+            "request_id 只能含字母、数字、下划线、连字符，长度 1..128"
+        )
+
+    source_id = payload.get("source_check_id")
+    if not isinstance(source_id, str) or not source_id.strip():
+        errors.append("source_check_id 必须是非空字符串（既有复核编号）")
+    elif not (source_id.startswith(_SOURCE_ID_PREFIX)
+              and len(source_id) == len(_SOURCE_ID_PREFIX) + 6
+              and source_id[len(_SOURCE_ID_PREFIX):].isdigit()):
+        errors.append(
+            f"source_check_id '{source_id}' 形式非法，应为 {_SOURCE_ID_PREFIX}"
+            "###### 形式的既有复核编号"
+        )
+
+    raw_obs = payload.get("fairness_obligations")
+    obligation_ids: List[str] = []
+    if not isinstance(raw_obs, list):
+        errors.append(
+            "fairness_obligations 必须是切换标识字符串数组（1..4 条）"
+        )
+    else:
+        n = len(raw_obs)
+        if n < MIN_OBLIGATIONS or n > MAX_OBLIGATIONS:
+            errors.append(
+                f"强公平义务数量必须在 {MIN_OBLIGATIONS}..{MAX_OBLIGATIONS}"
+                f" 之间，实际 {n}"
+            )
+        seen: set = set()
+        for idx, item in enumerate(raw_obs):
+            where = f"fairness_obligations[{idx}]"
+            if not isinstance(item, str) or not item:
+                errors.append(f"{where} 必须是非空切换 id 字符串")
+                continue
+            if not _valid_name(item):
+                errors.append(f"{where} '{item}' 不是合法切换标识")
+                continue
+            if item in seen:
+                errors.append(f"{where} 义务切换 '{item}' 重复提交")
+                continue
+            seen.add(item)
+            obligation_ids.append(item)
+
+    if errors:
+        raise ValidationError(errors)
+    return {
+        "request_id": request_id,
+        "source_check_id": source_id,
+        "obligation_ids": obligation_ids,
+    }
+
+
+def validate_obligations_against_source(
+    obligation_ids: List[str], source_record: Dict[str, Any]
+) -> List[Dict[str, str]]:
+    """逐条核对义务切换存在于冻结的来源规程；返回归一化义务。
+
+    不存在即抛 :class:`ValidationError`（定位到第几条与切换 id）。
+    来源规程本身只读，不做任何改写。
+    """
+    switch_by_id = {sw["id"]: sw for sw in source_record["frozen_spec"]["switches"]}
+    errors: List[str] = []
+    out: List[Dict[str, str]] = []
+    for idx, sid in enumerate(obligation_ids):
+        sw = switch_by_id.get(sid)
+        if sw is None:
+            errors.append(
+                f"fairness_obligations[{idx}] 切换 '{sid}' 在来源复核 "
+                f"{source_record['id']} 的冻结规程中不存在"
+            )
+            continue
+        out.append({"id": sw["id"], "source": sw["source"],
+                    "target": sw["target"]})
+    if errors:
+        raise ValidationError(errors)
+    return out

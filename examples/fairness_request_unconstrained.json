@@ -1,0 +1,6 @@
+{
+  "_comment": "强公平复核请求模板（未受约束违规环仍返回）：义务切换 t_clear 的源位置是 grant，原饥饿环 idle->req->idle 中 grant 从不出现，义务前提不成立，违规闭环依旧；返回 holds=false 与逐项义务说明。source_check_id 同样替换为实际编号。",
+  "request_id": "fairness-demo-0002",
+  "source_check_id": "CHK-000001",
+  "fairness_obligations": ["t_clear"]
+}

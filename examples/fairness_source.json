@@ -1,0 +1,17 @@
+{
+  "_comment": "强公平复核示例第 1 步：先提交既有联锁复核（无公平时 t_late 饥饿环违规），记录返回的 id（如 CHK-000001）",
+  "locations": ["idle", "req", "grant"],
+  "initial": "idle",
+  "switches": [
+    {"id": "t_apply",  "source": "idle",  "target": "req"},
+    {"id": "t_late",   "source": "req",   "target": "idle"},
+    {"id": "t_permit", "source": "req",   "target": "grant"},
+    {"id": "t_clear",  "source": "grant", "target": "idle"}
+  ],
+  "propositions": {
+    "idle":  [],
+    "req":   ["request"],
+    "grant": ["granted"]
+  },
+  "formula": "G(!request | F granted)"
+}

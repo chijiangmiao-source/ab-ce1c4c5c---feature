@@ -79,6 +79,22 @@ COMPLIANT = {
     "formula": "G(!request | F granted)",
 }
 
+# 既有复核（无公平假设时违规）：req 可经 t_late 迟发回 idle，
+# 也可经 t_permit 放行到 grant
+FAIR_SOURCE = {
+    "locations": ["idle", "req", "grant"],
+    "initial": "idle",
+    "switches": [
+        {"id": "t_apply", "source": "idle", "target": "req"},
+        {"id": "t_late", "source": "req", "target": "idle"},
+        {"id": "t_permit", "source": "req", "target": "grant"},
+        {"id": "t_clear", "source": "grant", "target": "idle"},
+    ],
+    "propositions": {"idle": [], "req": ["request"],
+                     "grant": ["granted"]},
+    "formula": "G(!request | F granted)",
+}
+
 
 def main():
     # 1. 构建检查
@@ -171,6 +187,110 @@ def main():
 
     status, body = http("GET", "/checks/CHK-000000")
     check("不存在编号 404", status == 404)
+
+    # 4. 强公平复核
+    section("强公平复核冒烟")
+    status, body = http("POST", "/checks", FAIR_SOURCE)
+    check("来源规程 POST /checks 201（无义务时违规）",
+          status == 201 and body.get("holds") is False,
+          f"status={status} body={body}")
+    source_id = body.get("id")
+    check("来源记录冻结规程/初态/公式",
+          isinstance(body.get("frozen_spec"), dict)
+          and body["frozen_spec"].get("initial") == "idle"
+          and "switches" in body["frozen_spec"])
+
+    # 4.1 公平消除原违规环
+    fair_req = {
+        "request_id": "acceptance-fair-1",
+        "source_check_id": source_id,
+        "fairness_obligations": ["t_permit"],
+    }
+    status, body = http("POST", "/fairness-checks", fair_req)
+    fr1 = body.get("id")
+    check("义务 t_permit 消除饥饿环：201 holds=true 且独立 FR 编号",
+          status == 201 and body.get("holds") is True
+          and fr1 and fr1.startswith("FR-"),
+          f"status={status} body={body}")
+    check("统计含全部 Büchi 公平集与强公平义务数",
+          body.get("stats", {}).get("strong_fairness_obligations") == 1
+          and body.get("stats", {}).get("buchi_fairness_sets", 0) >= 1)
+    check("逐项说明该义务为何满足",
+          len(body.get("obligations", [])) == 1
+          and body["obligations"][0].get("satisfied") is True)
+    check("强公平结论可按 FR 编号读取",
+          http("GET", f"/fairness-checks/{fr1}")[0] == 200)
+
+    # 同一请求标识及载荷重传 -> 原结果
+    status, body = http("POST", "/fairness-checks", fair_req)
+    check("同标识同载荷重传 200 返回原结果（replayed=true，编号不变）",
+          status == 200 and body.get("replayed") is True
+          and body.get("id") == fr1)
+
+    # 4.2 未受约束违规环仍可返回
+    unconstrained = dict(fair_req, request_id="acceptance-fair-2",
+                         fairness_obligations=["t_clear"])
+    status, body = http("POST", "/fairness-checks", unconstrained)
+    v = body.get("violation") or {}
+    steps = v.get("steps", [])
+    m = v.get("loop_start_index")
+    loop_locs = [s.get("location") for s in steps[m:]] if m is not None else []
+    check("义务 t_clear 不触及饥饿环：201 holds=false 仍返回闭环",
+          status == 201 and body.get("holds") is False and v,
+          f"status={status} body={body}")
+    check("闭环仍为 req 饥饿环（经 request 不经 grant）",
+          "req" in loop_locs and "grant" not in loop_locs,
+          f"loop_locs={loop_locs}")
+    ob = (body.get("obligations") or [{}])[0]
+    check("逐项说明：源位置 grant 未在环中无限出现，义务前提不成立",
+          ob.get("switch") == "t_clear"
+          and ob.get("source_occurs_in_cycle") is False
+          and ob.get("satisfied") is True,
+          str(ob))
+
+    # 4.3 复用标识改变义务 -> 409 且不改写
+    changed = dict(fair_req, fairness_obligations=["t_late"])
+    status, body = http("POST", "/fairness-checks", changed)
+    check("复用 request_id 改变义务集合 409 拒绝",
+          status == 409 and body.get("error") == "request_id_conflict"
+          and body.get("existing_id") == fr1,
+          f"status={status} body={body}")
+    status, body = http("GET", f"/fairness-checks/{fr1}")
+    check("原强公平复核未被改写",
+          body.get("obligation_switches") == ["t_permit"])
+    status, before = http("GET", f"/checks/{source_id}")
+    http("POST", "/fairness-checks", dict(
+        fair_req, request_id="acceptance-fair-3",
+        fairness_obligations=["not_existing"]))
+    status, after = http("GET", f"/checks/{source_id}")
+    check("义务切换不存在 400 定位拒绝且来源复核不被改写",
+          before == after)
+
+    # 4.4 定位拒绝：来源编号不存在 / 超上限 / 重复，均不生成 FR 审计
+    st, b = http("POST", "/fairness-checks", {
+        "request_id": "acceptance-x", "source_check_id": "CHK-000999",
+        "fairness_obligations": ["t_permit"]})
+    check("来源编号不存在 404 且不分配 FR 编号",
+          st == 404 and b.get("error") == "source_not_found"
+          and "id" not in b, f"status={st} body={b}")
+    st, b = http("POST", "/fairness-checks", {
+        "request_id": "acceptance-y", "source_check_id": source_id,
+        "fairness_obligations": ["t_apply", "t_late", "t_permit",
+                                 "t_clear", "t_clear"]})
+    check("义务超过上限（5 条）400 定位拒绝",
+          st == 400 and any("1..4" in e for e in b.get("errors", [])),
+          f"status={st} body={b}")
+    st, b = http("POST", "/fairness-checks", {
+        "request_id": "acceptance-z", "source_check_id": source_id,
+        "fairness_obligations": ["t_permit", "t_permit"]})
+    check("义务重复 400 定位拒绝",
+          st == 400 and any("重复" in e for e in b.get("errors", [])))
+    st, b = http("POST", "/fairness-checks", {
+        "request_id": "acceptance-w", "source_check_id": source_id,
+        "fairness_obligations": ["ghost_edge"]})
+    check("义务切换不存在 400 定位拒绝且不生成审计",
+          st == 400 and any("ghost_edge" in e for e in b.get("errors", []))
+          and "id" not in b)
 
     section("汇总")
     if FAILURES:
