@@ -145,5 +145,141 @@ class TestHttpApi(ServerTestBase):
         self.assertEqual(status, 404)
 
 
+# 可放行也可饥饿：req->idle 饥饿环 与 req->grant 放行环并存
+FAIR_PROCEDURE = {
+    "locations": ["idle", "req", "grant"],
+    "initial": "idle",
+    "switches": [
+        {"id": "t1", "source": "idle", "target": "req"},
+        {"id": "t2", "source": "req", "target": "idle"},
+        {"id": "t3", "source": "req", "target": "grant"},
+        {"id": "t4", "source": "grant", "target": "idle"},
+    ],
+    "propositions": {"idle": [], "req": ["request"],
+                     "grant": ["request", "granted"]},
+    "formula": "G(!request | F granted)",
+}
+
+
+class TestStrongFairnessApi(ServerTestBase):
+    def test_freeze_and_independent_audit_id(self):
+        status, body = self.request("POST", "/checks", FAIR_PROCEDURE)
+        self.assertEqual(status, 201)
+        self.assertFalse(body["holds"])
+        source_id = body["id"]
+        self.assertIn("frozen", body)
+        self.assertEqual(body["frozen"]["formula"],
+                         FAIR_PROCEDURE["formula"])
+
+        # 施加放行义务：公平消除饥饿环 -> holds=true，独立编号
+        status, body = self.request("POST", "/fairness-checks", {
+            "source": source_id, "strong_fairness": ["t3"],
+        })
+        self.assertEqual(status, 201, body)
+        self.assertTrue(body["holds"])
+        self.assertNotEqual(body["id"], source_id)
+        self.assertEqual(body["fairness_of"], source_id)
+        self.assertEqual(body["strong_fairness"],
+                         [{"switch": "t3", "source": "req"}])
+
+        # 来源复核绝不被改写
+        _, source = self.request("GET", f"/checks/{source_id}")
+        self.assertFalse(source["holds"])
+
+    def test_unconstrained_violation_loop_still_returned(self):
+        _, created = self.request("POST", "/checks", FAIR_PROCEDURE)
+        status, body = self.request("POST", "/fairness-checks", {
+            "source": created["id"], "strong_fairness": ["t2"],
+        })
+        self.assertEqual(status, 201)
+        self.assertFalse(body["holds"])
+        v = body["violation"]
+        loop = v["steps"][v["loop_start_index"]:]
+        self.assertIn("t2", [s["switch_taken"] for s in loop])
+        self.assertNotIn("grant", [s["location"] for s in loop])
+        outcomes = v["strong_fairness"]
+        self.assertEqual(len(outcomes), 1)
+        self.assertEqual(outcomes[0]["status"], "satisfied")
+        self.assertIn("explanation", outcomes[0])
+
+    def test_source_not_found_no_audit(self):
+        status, body = self.request("POST", "/fairness-checks", {
+            "source": "CHK-999999", "strong_fairness": ["t3"],
+        })
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"], "source_not_found")
+        self.assertNotIn("id", body)
+
+    def test_obligation_switch_errors_localized(self):
+        _, created = self.request("POST", "/checks", FAIR_PROCEDURE)
+        for bad in (["ghost"], ["t3", "t3"], ["t1", "t2", "t3", "t4", "t3"]):
+            status, body = self.request("POST", "/fairness-checks", {
+                "source": created["id"], "strong_fairness": bad,
+            })
+            self.assertEqual(status, 400, bad)
+            self.assertEqual(body["error"], "validation_failed")
+            self.assertNotIn("id", body)
+        # 缺少义务字段
+        status, body = self.request("POST", "/fairness-checks", {
+            "source": created["id"],
+        })
+        self.assertEqual(status, 400)
+
+    def test_request_id_replay_and_conflict(self):
+        # 重传返回原结果（200 + idempotent_replay）
+        status, body = self.request("POST", "/checks", {
+            **FAIR_PROCEDURE, "request_id": "job-1",
+        })
+        self.assertEqual(status, 201)
+        first_id = body["id"]
+        status, body = self.request("POST", "/checks", {
+            **FAIR_PROCEDURE, "request_id": "job-1",
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(body["id"], first_id)
+        self.assertTrue(body["idempotent_replay"])
+
+        # 复用标识改变义务 -> 409，不生成新编号
+        status, body = self.request("POST", "/checks", {
+            **FAIR_PROCEDURE, "request_id": "job-1",
+            "strong_fairness": ["t3"],
+        })
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"], "request_id_conflict")
+        self.assertEqual(body["existing_id"], first_id)
+
+        # 公平复核端点同样支持重传与冲突
+        status, f1 = self.request("POST", "/fairness-checks", {
+            "source": first_id, "strong_fairness": ["t3"],
+            "request_id": "fair-1",
+        })
+        self.assertEqual(status, 201)
+        status, f2 = self.request("POST", "/fairness-checks", {
+            "source": first_id, "strong_fairness": ["t3"],
+            "request_id": "fair-1",
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(f2["id"], f1["id"])
+        status, body = self.request("POST", "/fairness-checks", {
+            "source": first_id, "strong_fairness": ["t2"],
+            "request_id": "fair-1",
+        })
+        self.assertEqual(status, 409)
+
+    def test_inline_obligations_on_checks(self):
+        status, body = self.request("POST", "/checks", {
+            **FAIR_PROCEDURE, "strong_fairness": ["t3"],
+        })
+        self.assertEqual(status, 201)
+        self.assertTrue(body["holds"])
+        self.assertEqual(body["stats"]["strong_fairness_obligations"], 1)
+        # 不存在的义务切换 400 且无审计
+        status, body = self.request("POST", "/checks", {
+            **FAIR_PROCEDURE, "strong_fairness": ["nope"],
+        })
+        self.assertEqual(status, 400)
+        self.assertNotIn("id", body)
+
+
 if __name__ == "__main__":
     unittest.main()

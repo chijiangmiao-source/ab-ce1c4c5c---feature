@@ -592,63 +592,245 @@ class Violation:
     prefix_switches: List[str]
     cycle_states: List[int]
     cycle_switches: List[str]
+    obligation_outcomes: List[Dict[str, Any]] = field(default_factory=list)
 
 
-def find_violation(product: Product) -> Optional[Violation]:
+def _tarjan_induced(
+    n: int,
+    edges: List[List[Tuple[int, str]]],
+    alive: Set[int],
+) -> List[List[int]]:
+    """alive 诱导子图上的 Tarjan SCC。"""
+    index_at: Dict[int, int] = {}
+    low: Dict[int, int] = {}
+    onstack: Set[int] = set()
+    stack: List[int] = []
+    counter = 0
+    sccs: List[List[int]] = []
+
+    def strong(v: int) -> None:
+        nonlocal counter
+        index_at[v] = low[v] = counter
+        counter += 1
+        stack.append(v)
+        onstack.add(v)
+        for w, _ in edges[v]:
+            if w not in alive:
+                continue
+            if w not in index_at:
+                strong(w)
+                low[v] = min(low[v], low[w])
+            elif w in onstack:
+                low[v] = min(low[v], index_at[w])
+        if low[v] == index_at[v]:
+            comp: List[int] = []
+            while True:
+                w = stack.pop()
+                onstack.discard(w)
+                comp.append(w)
+                if w == v:
+                    break
+            sccs.append(comp)
+
+    for v in range(n):
+        if v in alive and v not in index_at:
+            strong(v)
+    return sccs
+
+
+def find_violation(
+    product: Product,
+    obligations: Optional[List[Dict[str, str]]] = None,
+) -> Optional[Violation]:
+    """在乘积中寻找被全部 Büchi 公平集与全部强公平义务接受的无限执行。
+
+    判定是广义 Büchi ∩ Streett 的 **SCC-hull 精确算法**（完整判定；
+    不做有限回放、随机抽样，也**不是仅删去义务边**——删边会错误地强制
+    义务切换必须被取）：
+
+    义务 j = 切换 s_j（源位置 L_j）即一对 Streett 偶 (Cn_j, En_j)：
+      若 L_j 在执行中无限次出现（Cn_j 无限命中），
+      则 s_j 必须无限次被取（En_j 无限命中）。
+    在有限 SCC C 内，若 C 含 Cn_j 状态却没有 s_j 的内部边，则任何留在 C
+    内的公平闭环都不能包含这些 Cn_j 状态（环上每点都无限重复），故将其
+    剪除以检查子环；缺某个 Büchi 公平集或非平凡性的 SCC 整团剪除。
+    迭代到不动点后仍存留的非平凡 SCC 即接受 SCC，其中必能拼出一条同时
+    无限次命中全部 Büchi 见证与全部有效义务边的闭合行走。
+    """
     P = product
+    obligations = obligations or []
     n = len(P.states)
     if n == 0 or not P.initial:
         return None
-    for comp in tarjan_scc(n, P.edges):
-        cset = set(comp)
-        self_loop = any(w == v for v in comp for w, _ in P.edges[v])
-        if len(comp) == 1 and not self_loop:
-            continue  # 平凡 SCC 不构成环
-        if not all(group & cset for group in P.fairness):
-            continue  # 广义 Büchi：每个公平集都要在环上出现
 
-        pref = _bfs(P.edges, P.initial, lambda v: v in cset)
-        if pref is None:
+    alive: Set[int] = set(range(n))
+    accepting: Optional[Set[int]] = None
+    while True:
+        remove: Set[int] = set()
+        candidate: Optional[Set[int]] = None
+        for comp in _tarjan_induced(n, P.edges, alive):
+            cset = set(comp)
+            internal_edges: List[Tuple[int, int, str]] = []
+            for v in comp:
+                for w, lab in P.edges[v]:
+                    if w in cset:
+                        internal_edges.append((v, w, lab))
+            nontrivial = len(comp) > 1 or any(w == v for v in comp
+                                             for w, _ in P.edges[v]
+                                             if w in cset)
+            if not nontrivial:
+                # 不在任何环上，不可能属于无限执行
+                remove |= cset
+                continue
+            if not all(group & cset for group in P.fairness):
+                # 缺 Büchi 公平集：其任意子环同样缺失，整团剪除
+                remove |= cset
+                continue
+            # Streett 筛选：被违反的义务只剪除其源位置状态（公平子环须避开）
+            penalized: Set[int] = set()
+            inner_labels = {lab for _, _, lab in internal_edges}
+            for obl in obligations:
+                src = obl["source"]
+                cn = {v for v in comp if P.states[v].loc == src}
+                if cn and obl["switch"] not in inner_labels:
+                    penalized |= cn
+            if penalized:
+                remove |= penalized
+                continue
+            # 该 SCC 同时满足全部 Büchi 公平集与全部强公平义务
+            candidate = cset
+        if not remove:
+            if candidate is not None:
+                accepting = candidate
+            break
+        alive -= remove
+
+    if accepting is None:
+        return None
+    cset = accepting
+
+    internal_edges: List[Tuple[int, int, str]] = []
+    for v in cset:
+        for w, lab in P.edges[v]:
+            if w in cset:
+                internal_edges.append((v, w, lab))
+    cycle_locs = {P.states[v].loc for v in cset}
+
+    pref = _bfs(P.edges, P.initial, lambda v: v in cset)
+    if pref is None:  # pragma: no cover - 乘积状态皆初态可达
+        return None
+    prefix_states, prefix_switches = pref
+    v0 = prefix_states[-1]
+
+    # 在 SCC 内选取各 Büchi 公平集见证点（尽量去重），依次行走并回到 v0，
+    # 拼成被全部公平集无限次命中的闭合行走。
+    witnesses: List[int] = []
+    used: Set[int] = set()
+    for group in P.fairness:
+        pick = next((x for x in group & cset if x not in used), None)
+        if pick is None:
+            pick = next(iter(group & cset))
+        used.add(pick)
+        witnesses.append(pick)
+
+    # 强公平义务见证：源位置在环上出现的每条义务，其内部边已由接受判定
+    # 保证存在；取一条并在周期中实际走过。
+    required_edges: List[Tuple[int, int, str]] = []
+    for obl in obligations:
+        if obl["source"] not in cycle_locs:
             continue
-        prefix_states, prefix_switches = pref
-        v0 = prefix_states[-1]
+        edge = next(e for e in internal_edges if e[2] == obl["switch"])
+        required_edges.append(edge)
 
-        # 在 SCC 内选取各公平集见证点（尽量去重），依次行走并回到 v0，
-        # 拼成被全部公平集无限次命中的闭合行走。
-        witnesses: List[int] = []
-        used: Set[int] = set()
-        for group in P.fairness:
-            pick = next((x for x in group & cset if x not in used), None)
-            if pick is None:
-                pick = next(iter(group & cset))
-            used.add(pick)
-            witnesses.append(pick)
+    # 途经点：Büchi 见证点与义务见证边交错；SCC 强连通，段必可达。
+    waypoints: List[Tuple[str, Any]] = [("state", w) for w in witnesses]
+    waypoints += [("edge", e) for e in required_edges]
 
-        cyc_verts: List[int] = [v0]
-        cyc_switches: List[str] = []
-        cur = v0
-        ok = True
-        for wstate in witnesses:
-            seg = _bfs_in(P.edges, cur, wstate, cset)
+    cyc_verts: List[int] = [v0]
+    cyc_switches: List[str] = []
+    cur = v0
+    ok = True
+    for kind, wp in waypoints:
+        if kind == "state":
+            seg = _bfs_in(P.edges, cur, wp, cset)
             if seg is None:
                 ok = False
                 break
             cyc_verts.extend(seg[0][1:])
             cyc_switches.extend(seg[1])
-            cur = wstate
-        # 回到 v0，且必须至少经过一条边（公平集为空或单点自环 SCC 时
-        # 不能退化为零长空走）
-        if ok:
-            back = _bfs_cycle_back(P.edges, cur, v0, cset)
-            if back is None:
+            cur = wp
+        else:
+            eu, ew, elab = wp
+            seg = _bfs_in(P.edges, cur, eu, cset)
+            if seg is None:
                 ok = False
-            else:
-                cyc_verts.extend(back[0][1:])
-                cyc_switches.extend(back[1])
-        if ok and cyc_switches:
-            return Violation(prefix_states, prefix_switches,
-                             cyc_verts, cyc_switches)
-    return None
+                break
+            cyc_verts.extend(seg[0][1:])
+            cyc_switches.extend(seg[1])
+            # 实际取义务见证边 eu -> ew（标 elab），使其随环无限发生
+            cyc_verts.append(ew)
+            cyc_switches.append(elab)
+            cur = ew
+    # 回到 v0，且必须至少经过一条边（公平集为空或单点自环 SCC 时
+    # 不能退化为零长空走）
+    if ok:
+        back = _bfs_cycle_back(P.edges, cur, v0, cset)
+        if back is None:
+            ok = False
+        else:
+            cyc_verts.extend(back[0][1:])
+            cyc_switches.extend(back[1])
+    if not ok or not cyc_switches:  # pragma: no cover - SCC 强连通保证可行
+        return None
+    outcomes = _obligation_outcomes(
+        obligations, P, cyc_verts, cyc_switches
+    )
+    return Violation(prefix_states, prefix_switches,
+                     cyc_verts, cyc_switches, outcomes)
+
+
+def _obligation_outcomes(
+    obligations: List[Dict[str, str]],
+    product: Product,
+    cyc_verts: List[int],
+    cyc_switches: List[str],
+) -> List[Dict[str, Any]]:
+    """逐条说明义务在闭环上的处置：已满足（切换随环无限发生）或
+    其源位置未在闭环中出现（前提不成立）。"""
+    cycle_loc_set = {product.states[v].loc for v in cyc_verts[:-1]}
+    taken_counts = {sid: 0 for sid in {o["switch"] for o in obligations}}
+    for lab in cyc_switches:
+        if lab in taken_counts:
+            taken_counts[lab] += 1
+    outcomes: List[Dict[str, Any]] = []
+    for obl in obligations:
+        sid, src = obl["switch"], obl["source"]
+        count = taken_counts.get(sid, 0)
+        if count > 0:
+            outcomes.append({
+                "switch": sid,
+                "source": src,
+                "status": "satisfied",
+                "times_per_cycle": count,
+                "explanation": (
+                    f"义务切换 '{sid}' 在每个闭环周期中被取 {count} 次，"
+                    "闭环无限重复故该切换无限次发生，强公平义务在循环中已满足。"
+                ),
+            })
+        else:
+            assert src not in cycle_loc_set
+            outcomes.append({
+                "switch": sid,
+                "source": src,
+                "status": "source_not_infinite",
+                "times_per_cycle": 0,
+                "explanation": (
+                    f"义务切换 '{sid}' 的源位置 '{src}' 未出现在闭环中"
+                    "（至多有限次出现在前缀），源位置不无限出现，"
+                    "强公平义务前提不成立，无需该切换发生。"
+                ),
+            })
+    return outcomes
 
 
 # ------------------------------------------ 套索上的子式真值（不动点迭代）
@@ -753,6 +935,7 @@ class CheckResult:
 
 def check(spec: Dict[str, Any]) -> CheckResult:
     formula_ast: Node = spec["formula_ast"]
+    obligations: List[Dict[str, str]] = spec.get("obligations", [])
     neg_nnf = push_negation(formula_ast, neg=True)
     gba = build_gba(neg_nnf)
     product = build_product(
@@ -762,12 +945,13 @@ def check(spec: Dict[str, Any]) -> CheckResult:
         spec["outgoing"],
         spec["propositions"],
     )
-    viol = find_violation(product)
+    viol = find_violation(product, obligations)
 
     stats = {
         "closure_size": len(gba.closure.nodes),
         "gba_states_reachable": len(gba.seen_aps),
         "fairness_sets": len(gba.events),
+        "strong_fairness_obligations": len(obligations),
         "product_states": len(product.states),
         "product_edges": sum(len(e) for e in product.edges),
     }
@@ -809,10 +993,12 @@ def check(spec: Dict[str, Any]) -> CheckResult:
             "cycle_length": r,
             "loop_start_index": m,
             "steps": steps,
+            "strong_fairness": viol.obligation_outcomes,
             "note": (
                 "前 prefix_length 步为有限前缀；自 loop_start_index 起进入长度 "
-                "cycle_length 的重复闭环，闭环被全部公平集无限次命中，"
-                "故为真正的无限执行，无法以有限回放掩盖迟发或永不发生。"
+                "cycle_length 的重复闭环，闭环被全部 Büchi 公平集无限次命中，"
+                "且每条强公平义务或其源位置未无限出现、或切换随闭环无限发生，"
+                "故为真正的公平无限执行，无法以有限回放、抽样或仅删去义务边掩盖。"
             ),
         },
         stats=stats,

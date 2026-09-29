@@ -1,0 +1,17 @@
+{
+  "_comment": "基础规程（先 POST /checks）：req 可走 t_late 回 idle 形成饥饿环，也可走 t_grant 放行；无强公平义务时 G(!request | F granted) 被判不成立。随后 POST /fairness-checks，body：{\"source\":\"<返回编号>\",\"strong_fairness\":[\"t_grant\"]} —— req 无限出现则放行切换必须无限发生，饥饿环被公平消除，holds=true，且生成独立审计编号、来源记录不改写。",
+  "locations": ["idle", "req", "grant"],
+  "initial": "idle",
+  "switches": [
+    {"id": "t_apply", "source": "idle",  "target": "req"},
+    {"id": "t_late",  "source": "req",   "target": "idle"},
+    {"id": "t_grant", "source": "req",   "target": "grant"},
+    {"id": "t_reset", "source": "grant", "target": "idle"}
+  ],
+  "propositions": {
+    "idle":  [],
+    "req":   ["request"],
+    "grant": ["request", "granted"]
+  },
+  "formula": "G(!request | F granted)"
+}

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 from .ltl_parser import FormulaSyntaxError, parse_formula
 
 MIN_LOCATIONS = 2
 MAX_LOCATIONS = 24
+MAX_OBLIGATIONS = 4
 
 # 这些大写前缀与一元/二元算子词法冲突，不能作为命题名
 _RESERVED_INITIALS = set("FGXU")
@@ -187,6 +188,14 @@ def validate_request(payload: Any) -> Dict[str, Any]:
             [f"位置 '{loc}' 没有外出切换（死端，禁止）" for loc in dead]
         )
 
+    # --- 强公平义务（1..4 条，引用已有切换）-----------------------------
+    # 每条义务：其切换源位置若在无限执行中反复出现，该切换也必须反复发生。
+    # 不存在 / 重复 / 超上限均定位拒绝，不生成审计编号。
+    raw_obligations = payload.get("strong_fairness",
+                                 payload.get("fairness_obligations"))
+    obligations = validate_obligations(raw_obligations, switches) \
+        if raw_obligations is not None else []
+
     return {
         "locations": locations,
         "initial": initial,
@@ -195,4 +204,57 @@ def validate_request(payload: Any) -> Dict[str, Any]:
         "formula": formula_text,
         "formula_ast": formula_ast,
         "outgoing": outgoing,
+        "obligations": obligations,
     }
+
+
+def validate_obligations(
+    raw_obligations: Any,
+    switches: List[Dict[str, str]],
+    field_name: str = "strong_fairness",
+) -> List[Dict[str, str]]:
+    """校验强公平义务列表（对已声明/已冻结切换集合）。
+
+    接受字符串数组（切换标识）或 ``{"switch": id}`` 对象数组；
+    不存在 / 重复 / 超过上限一律抛 :class:`ValidationError`（定位拒绝）。
+    返回 ``[{"switch": 切换id, "source": 源位置}, ...]``。
+    """
+    errors: List[str] = []
+    switch_ids = {sw["id"] for sw in switches}
+    obligations: List[Dict[str, str]] = []
+    if not isinstance(raw_obligations, list):
+        raise ValidationError([f"{field_name} 必须是数组"])
+    n_ob = len(raw_obligations)
+    if n_ob > MAX_OBLIGATIONS:
+        errors.append(
+            f"强公平义务最多 {MAX_OBLIGATIONS} 条，实际 {n_ob} 条"
+        )
+    seen_ob: set = set()
+    for idx, item in enumerate(raw_obligations):
+        where = f"{field_name}[{idx}]"
+        sw_id: Any = None
+        if isinstance(item, str):
+            sw_id = item
+        elif isinstance(item, dict):
+            sw_id = item.get("switch", item.get("switch_id"))
+        else:
+            errors.append(f"{where} 必须是切换标识字符串或对象")
+            continue
+        if not isinstance(sw_id, str) or not sw_id:
+            errors.append(f"{where} 必须指定非空切换标识")
+            continue
+        if n_ob <= MAX_OBLIGATIONS and sw_id in seen_ob:
+            errors.append(
+                f"{where} 义务切换 '{sw_id}' 重复（同一切换不得重复声明）"
+            )
+        if sw_id not in switch_ids:
+            errors.append(
+                f"{where} 切换 '{sw_id}' 不存在（义务只能引用已声明切换）"
+            )
+        seen_ob.add(sw_id)
+        if sw_id in switch_ids:
+            src = next(s["source"] for s in switches if s["id"] == sw_id)
+            obligations.append({"switch": sw_id, "source": src})
+    if errors:
+        raise ValidationError(errors)
+    return obligations
